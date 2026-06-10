@@ -1,0 +1,1 @@
+In this project we try to identify stock pairs that 
