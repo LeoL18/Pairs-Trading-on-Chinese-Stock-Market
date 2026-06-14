@@ -56,6 +56,7 @@ class PairTradingConfig:
     capital: float = 1_000_000.0        # total capital in CNY
     fixed_notional: float = 100_000.0  # used when sizing == "fixed_notional"
     vol_window: int = 20                # lookback for vol-scaled sizing
+    cash_buffer_pct: float = 0.40           # what percent of total capital to buffer
 
     # --- transaction costs (A-share defaults) ---
     commission_rate: float = 0.0003     # 0.03% each way
@@ -78,7 +79,6 @@ class MultiPairTradingConfig:
     start_date: str                     # "YYYYMMDD"
     end_date: str
     capital: float = 1_000_000.0        # total capital in CNY
-    cash_buffer_pct: float = 0.05       # keep a buffer when sizing entries
     db_path: str | Path = Path("data/prices.sqlite")
 
 
@@ -303,12 +303,12 @@ def _compute_notional(
     sizing = cfg.sizing
 
     if sizing == "fixed_notional":
-        notional_a = min(cfg.fixed_notional, available_capital * 0.9)
+        notional_a = min(cfg.fixed_notional, available_capital)
         notional_b = notional_a * beta * (price_b / price_a) if price_a > 0 else notional_a
 
     elif sizing == "dollar_neutral":
         # Split available capital into two equal legs (dollar neutral)
-        half = available_capital * 0.45   # 45% each side, 10% buffer
+        half = available_capital * 0.5   
         notional_a = half
         notional_b = half
 
@@ -320,9 +320,9 @@ def _compute_notional(
         vol = recent_spread.std()
         if np.isnan(vol) or vol == 0:
             vol = 1.0
-        base = available_capital * 0.40
+        base = available_capital 
         # Invert vol: higher vol → smaller size
-        ref_vol = spread_df["spread"].std()
+        ref_vol = spread_df["spread"].iloc[: idx + 1].std()
         scale = ref_vol / vol if ref_vol > 0 else 1.0
         scale = np.clip(scale, 0.25, 2.0)
         notional_a = base * scale
@@ -608,23 +608,49 @@ def _compute_stats(equity_df: pd.DataFrame, trade_df: pd.DataFrame, cfg: MultiPa
         n_trades = min(len(entries), len(exits))
         total_costs = trade_df["transaction_cost"].sum()
 
-        # Round-trip PnL approximation (notional difference)
+        # Round-trip PnL: group by pair label and match full trades together
         pnls = []
-        for leg in ["A", "B"]:
-            e_leg = entries[entries["leg"] == leg].reset_index(drop=True)
-            x_leg = exits[exits["leg"] == leg].reset_index(drop=True)
-            pairs = min(len(e_leg), len(x_leg))
-            for j in range(pairs):
-                e_row = e_leg.iloc[j]
-                x_row = x_leg.iloc[j]
-                if e_row["action"] == "BUY":
-                    pnl = x_row["notional"] - e_row["notional"] - e_row["transaction_cost"] - x_row["transaction_cost"]
-                else:  # SHORT_OPEN
-                    pnl = e_row["notional"] - x_row["notional"] - e_row["transaction_cost"] - x_row["transaction_cost"]
-                pnls.append(pnl)
+        for pair_label in trade_df["pair"].unique():
+            pair_trades = trade_df[trade_df["pair"] == pair_label]
+            
+            # Separate entry and exit events by date (each round-trip is one entry date + one exit date)
+            entry_actions = pair_trades[pair_trades["action"].isin(["BUY", "SHORT_OPEN"])]
+            exit_actions  = pair_trades[pair_trades["action"].isin(["SELL", "SHORT_CLOSE"])]
+            
+            # Group by date to get full round-trips
+            entry_dates = entry_actions["date"].unique()
+            exit_dates  = exit_actions["date"].unique()
+            
+            for i in range(min(len(entry_dates), len(exit_dates))):
+                e_date = entry_dates[i]
+                x_date = exit_dates[i]
+                
+                e_rows = pair_trades[pair_trades["date"] == e_date]
+                x_rows = pair_trades[pair_trades["date"] == x_date]
+                
+                # Determine direction from entry
+                long_leg  = e_rows[e_rows["action"] == "BUY"].iloc[0]   if len(e_rows[e_rows["action"] == "BUY"]) > 0   else None
+                short_leg = e_rows[e_rows["action"] == "SHORT_OPEN"].iloc[0] if len(e_rows[e_rows["action"] == "SHORT_OPEN"]) > 0 else None
+                
+                long_close  = x_rows[x_rows["action"] == "SELL"].iloc[0]        if len(x_rows[x_rows["action"] == "SELL"]) > 0        else None
+                short_close = x_rows[x_rows["action"] == "SHORT_CLOSE"].iloc[0] if len(x_rows[x_rows["action"] == "SHORT_CLOSE"]) > 0 else None
+                
+                if long_leg is None or short_leg is None or long_close is None or short_close is None:
+                    continue
+                
+                # Long leg P&L: exit notional - entry notional
+                long_pnl  = long_close["notional"]  - long_leg["notional"]
+                # Short leg P&L: entry notional - exit notional (profit when price falls)
+                short_pnl = short_leg["notional"] - short_close["notional"]
+                # Total costs for this round-trip
+                costs = (long_leg["transaction_cost"] + short_leg["transaction_cost"]
+                    + long_close["transaction_cost"] + short_close["transaction_cost"])
+                
+                pnls.append(long_pnl + short_pnl - costs)
 
-        win_rate = sum(1 for p in pnls if p > 0) / len(pnls) if pnls else np.nan
+        win_rate    = sum(1 for p in pnls if p > 0) / len(pnls) if pnls else np.nan
         avg_trade_pnl = np.mean(pnls) if pnls else np.nan
+        n_trades    = len(pnls)
 
     return {
         "total_return_pct": round(total_return * 100, 2),
@@ -708,306 +734,242 @@ def _run_multi_pair_backtest(
     SHORT_SPREAD = -1
 
     cash = cfg.capital
-    trade_log = []
-    equity_rows = []
-    run_warnings = []
+    position = 0.0
+    unrealized_pnl = 0.0
+    trade_log: list[dict] = []
+    equity_rows: list[dict] = []
+    run_warnings: list[str] = []
 
     pair_states: dict[str, dict] = {}
     for pair_cfg in cfg.pairs:
         label = _pair_label(pair_cfg)
         pair_states[label] = {
-            "cfg": pair_cfg,
-            "state": FLAT,
-            "pos_a_shares": 0.0,
-            "pos_b_shares": 0.0,
-            "pos_a_value": 0.0,
-            "pos_b_value": 0.0,
-            "pos_a_side": None,
-            "pos_b_side": None,
-            "entry_date": None,
-            "entry_beta": None,
-            "last_price_a": None,
-            "last_price_b": None,
+            "cfg":            pair_cfg,
+            "state":          FLAT,
+            "pos_a_shares":   0.0,
+            "pos_b_shares":   0.0,
+            "pos_a_value":    0.0,
+            "pos_b_value":    0.0,
+            "pos_a_side":     None,
+            "pos_b_side":     None,
+            "entry_date":     None,
+            "entry_beta":     None,
+            "last_price_a":   None,
+            "last_price_b":   None,
             "last_pct_chg_a": None,
             "last_pct_chg_b": None,
+            "unrealized_pnl": 0.0,
         }
 
-    all_dates = sorted({dt for df in spread_dfs.values() for dt in df.index})
+    all_dates = sorted({dt for df in spread_dfs.values() for dt in df.index})[pair_cfg.ols_window: ] # prevent bias
 
     for dt in all_dates:
-        total_pos_value = 0.0
-        for label, state in pair_states.items():
-            row = None
-            if dt in spread_dfs[label].index:
-                row = spread_dfs[label].loc[dt]
-                state["last_price_a"] = row["adj_close_a"]
-                state["last_price_b"] = row["adj_close_b"]
-                state["last_pct_chg_a"] = row["pct_chg_a"]
-                state["last_pct_chg_b"] = row["pct_chg_b"]
 
-            if state["state"] != FLAT and state["last_price_a"] is not None and state["last_price_b"] is not None:
-                if state["state"] == LONG_SPREAD:
-                    total_pos_value += state["pos_a_shares"] * state["last_price_a"] - state["pos_b_shares"] * state["last_price_b"]
-                else:
-                    total_pos_value += state["pos_b_shares"] * state["last_price_b"] - state["pos_a_shares"] * state["last_price_a"]
+        # ── 1. Mark-to-market (before exits/entries) ──────────────────────
+        for label, state in pair_states.items():
+            if dt not in spread_dfs[label].index:
+                continue
+            row = spread_dfs[label].loc[dt]
+
+            if (
+                state["state"] != FLAT
+                and state["last_price_a"] is not None
+                and state["last_price_b"] is not None
+            ):
+                delta_a = state["pos_a_shares"] * (row["adj_close_a"] - state["last_price_a"])
+                delta_b = state["pos_b_shares"] * (row["adj_close_b"] - state["last_price_b"])
+                daily = delta_a - delta_b if state["state"] == LONG_SPREAD else delta_b - delta_a
+                state["unrealized_pnl"] += daily
+                position += daily
+                unrealized_pnl += daily
+
+            # Always update so next day's delta is correct
+            state["last_price_a"]   = row["adj_close_a"]
+            state["last_price_b"]   = row["adj_close_b"]
+            state["last_pct_chg_a"] = row["pct_chg_a"]
+            state["last_pct_chg_b"] = row["pct_chg_b"]
 
         equity_rows.append({
-            "date": dt,
-            "portfolio_value": cash + total_pos_value,
-            "cash": cash,
-            "position_value": total_pos_value,
+            "date":            dt,
+            "portfolio_value": cash + position,
+            "cash":            cash,
+            "position_value":  unrealized_pnl,
         })
 
-        # Process exits first so closed capital is available for same-day re-entry.
+        # ── 2. Exits ───────────────────────────────────────────────────────
         for label, state in pair_states.items():
-            row = None
-            if dt in spread_dfs[label].index:
-                row = spread_dfs[label].loc[dt]
-
-            if row is None or state["state"] == FLAT:
+            if dt not in spread_dfs[label].index or state["state"] == FLAT:
                 continue
 
+            row      = spread_dfs[label].loc[dt]
             pair_cfg = state["cfg"]
-            z = row["z_score"]
-            beta = row["hedge_ratio"]
-            price_a = row["adj_close_a"]
-            price_b = row["adj_close_b"]
-            a_locked = _is_limit_locked(row.reindex(["pct_chg_a"]).rename({"pct_chg_a": "pct_chg"}))
-            b_locked = _is_limit_locked(row.reindex(["pct_chg_b"]).rename({"pct_chg_b": "pct_chg"}))
-            either_locked = a_locked or b_locked
+            z        = row["z_score"]
+            price_a  = row["adj_close_a"]
+            price_b  = row["adj_close_b"]
 
-            t1_ok = state["entry_date"] is None or ((dt - state["entry_date"]).days >= 1)
+            a_locked     = _is_limit_locked(row.reindex(["pct_chg_a"]).rename({"pct_chg_a": "pct_chg"}))
+            b_locked     = _is_limit_locked(row.reindex(["pct_chg_b"]).rename({"pct_chg_b": "pct_chg"}))
+            if a_locked or b_locked:
+                continue
+
+            t1_ok = state["entry_date"] is None or (dt - state["entry_date"]).days >= 1
+
             should_exit = False
             exit_reason = ""
+            if state["state"] == LONG_SPREAD:
+                if t1_ok:
+                    if abs(z) <= pair_cfg.exit_z:
+                        should_exit, exit_reason = True, "mean_reversion"
+                    elif z < -pair_cfg.stop_loss_z:
+                        should_exit, exit_reason = True, "stop_loss"
+                    elif z > pair_cfg.entry_z:
+                        should_exit, exit_reason = True, "signal_flip"
+            else:  # SHORT_SPREAD
+                if t1_ok:
+                    if abs(z) <= pair_cfg.exit_z:
+                        should_exit, exit_reason = True, "mean_reversion"
+                    elif z > pair_cfg.stop_loss_z:
+                        should_exit, exit_reason = True, "stop_loss"
+                    elif z < -pair_cfg.entry_z:
+                        should_exit, exit_reason = True, "signal_flip"
+
+            if not should_exit:
+                continue
+
+            exit_na = state["pos_a_shares"] * price_a
+            exit_nb = state["pos_b_shares"] * price_b
 
             if state["state"] == LONG_SPREAD:
-                if not t1_ok:
-                    pass
-                elif abs(z) <= pair_cfg.exit_z:
-                    should_exit = True
-                    exit_reason = "mean_reversion"
-                elif z < -pair_cfg.stop_loss_z:
-                    should_exit = True
-                    exit_reason = "stop_loss"
-                elif z > pair_cfg.entry_z:
-                    should_exit = True
-                    exit_reason = "signal_flip"
+                # Sell A (long leg), buy-to-cover B (short leg)
+                cost_a = _calc_cost(exit_na, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cost_b = _calc_cost(exit_nb, "buy",  pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cash += exit_na - cost_a
+                cash -= exit_nb + cost_b
+                position -= exit_na - exit_nb
+                actions = [
+                    ("A", pair_cfg.ts_code_a, "SELL",        state["pos_a_shares"], price_a, exit_na, cost_a),
+                    ("B", pair_cfg.ts_code_b, "SHORT_CLOSE",  state["pos_b_shares"], price_b, exit_nb, cost_b),
+                ]
             else:
-                if not t1_ok and state["pos_b_side"] == "long":
-                    pass
-                elif abs(z) <= pair_cfg.exit_z:
-                    should_exit = True
-                    exit_reason = "mean_reversion"
-                elif z > pair_cfg.stop_loss_z:
-                    should_exit = True
-                    exit_reason = "stop_loss"
-                elif z < -pair_cfg.entry_z:
-                    should_exit = True
-                    exit_reason = "signal_flip"
+                # Buy-to-cover A (short leg), sell B (long leg)
+                cost_a = _calc_cost(exit_na, "buy",  pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cost_b = _calc_cost(exit_nb, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cash -= exit_na + cost_a
+                cash += exit_nb - cost_b
+                position -= exit_nb - exit_na
+                actions = [
+                    ("A", pair_cfg.ts_code_a, "SHORT_CLOSE", state["pos_a_shares"], price_a, exit_na, cost_a),
+                    ("B", pair_cfg.ts_code_b, "SELL",         state["pos_b_shares"], price_b, exit_nb, cost_b),
+                ]
 
-            if should_exit and not either_locked:
-                exit_na = state["pos_a_shares"] * price_a
-                exit_nb = state["pos_b_shares"] * price_b
-                if state["state"] == LONG_SPREAD:
-                    cost_a = _calc_cost(exit_na, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                    cost_b = _calc_cost(exit_nb, "buy", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                    cash += exit_na - cost_a
-                    cash -= exit_nb + cost_b
-                    trade_log.append({
-                        "date": dt,
-                        "pair": label,
-                        "leg": "A",
-                        "ts_code": pair_cfg.ts_code_a,
-                        "action": "SELL",
-                        "shares": state["pos_a_shares"],
-                        "price": price_a,
-                        "notional": exit_na,
-                        "transaction_cost": cost_a,
-                        "note": exit_reason,
-                    })
-                    trade_log.append({
-                        "date": dt,
-                        "pair": label,
-                        "leg": "B",
-                        "ts_code": pair_cfg.ts_code_b,
-                        "action": "SHORT_CLOSE",
-                        "shares": state["pos_b_shares"],
-                        "price": price_b,
-                        "notional": exit_nb,
-                        "transaction_cost": cost_b,
-                        "note": exit_reason,
-                    })
-                else:
-                    cost_a = _calc_cost(exit_na, "buy", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                    cost_b = _calc_cost(exit_nb, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                    cash -= exit_na + cost_a
-                    cash += exit_nb - cost_b
-                    trade_log.append({
-                        "date": dt,
-                        "pair": label,
-                        "leg": "A",
-                        "ts_code": pair_cfg.ts_code_a,
-                        "action": "SHORT_CLOSE",
-                        "shares": state["pos_a_shares"],
-                        "price": price_a,
-                        "notional": exit_na,
-                        "transaction_cost": cost_a,
-                        "note": exit_reason,
-                    })
-                    trade_log.append({
-                        "date": dt,
-                        "pair": label,
-                        "leg": "B",
-                        "ts_code": pair_cfg.ts_code_b,
-                        "action": "SELL",
-                        "shares": state["pos_b_shares"],
-                        "price": price_b,
-                        "notional": exit_nb,
-                        "transaction_cost": cost_b,
-                        "note": exit_reason,
-                    })
+            for leg, ts_code, action, shares, price, notional, cost in actions:
+                trade_log.append({
+                    "date": dt, "pair": label, "leg": leg, "ts_code": ts_code,
+                    "action": action, "shares": shares, "price": price,
+                    "notional": notional, "transaction_cost": cost, "note": exit_reason,
+                })
 
-                state["state"] = FLAT
-                state["pos_a_shares"] = 0.0
-                state["pos_b_shares"] = 0.0
-                state["pos_a_value"] = 0.0
-                state["pos_b_value"] = 0.0
-                state["pos_a_side"] = None
-                state["pos_b_side"] = None
-                state["entry_date"] = None
-                state["entry_beta"] = None
+            # MTM already captured today's move; remove this pair's unrealized from the
+            # running total since it now settles into cash
+            unrealized_pnl -= state["unrealized_pnl"]
 
-        # Entry logic after exits
+            state.update({
+                "state":          FLAT,
+                "pos_a_shares":   0.0,   "pos_b_shares":   0.0,
+                "pos_a_value":    0.0,   "pos_b_value":    0.0,
+                "pos_a_side":     None,  "pos_b_side":     None,
+                "entry_date":     None,  "entry_beta":      None,
+                "unrealized_pnl": 0.0,
+                # Keep last_price_a/b so next entry's first delta is correct
+            })
+
+        # ── 3. Entries ─────────────────────────────────────────────────────
         for label, state in pair_states.items():
-            row = None
-            if dt in spread_dfs[label].index:
-                row = spread_dfs[label].loc[dt]
-
-            if row is None or state["state"] != FLAT:
+            if dt not in spread_dfs[label].index or state["state"] != FLAT:
                 continue
 
+            row      = spread_dfs[label].loc[dt]
             pair_cfg = state["cfg"]
-            z = row["z_score"]
-            beta = row["hedge_ratio"]
-            price_a = row["adj_close_a"]
-            price_b = row["adj_close_b"]
+            z        = row["z_score"]
+            beta     = row["hedge_ratio"]
+            price_a  = row["adj_close_a"]
+            price_b  = row["adj_close_b"]
+
+            if np.isnan(z) or np.isnan(beta) or price_a <= 0 or price_b <= 0:
+                continue
+
             a_locked = _is_limit_locked(row.reindex(["pct_chg_a"]).rename({"pct_chg_a": "pct_chg"}))
             b_locked = _is_limit_locked(row.reindex(["pct_chg_b"]).rename({"pct_chg_b": "pct_chg"}))
-            either_locked = a_locked or b_locked
-
-            if either_locked or np.isnan(z) or np.isnan(beta):
+            if a_locked or b_locked:
                 continue
 
-            enter_long = (z < -pair_cfg.entry_z) and pair_cfg.direction in ("long_short", "long_only")
-            enter_short = (z > pair_cfg.entry_z) and pair_cfg.direction in ("long_short", "short_only")
-            if not (enter_long or enter_short):
+            enter_long  = z < -pair_cfg.entry_z and pair_cfg.direction in ("long_short", "long_only")
+            enter_short = z >  pair_cfg.entry_z and pair_cfg.direction in ("long_short", "short_only")
+            
+            if not (enter_long or enter_short) or abs(z) > pair_cfg.stop_loss_z:
                 continue
 
             na, nb = _compute_notional(
-                pair_cfg,
-                price_a,
-                price_b,
-                beta,
-                spread_dfs[label],
-                dt,
-                cash * (1.0 - cfg.cash_buffer_pct),
+                pair_cfg, price_a, price_b, beta,
+                spread_dfs[label], dt,
+                cash * (1.0 - pair_states[label]["cfg"].cash_buffer_pct),
             )
 
-            shares_a = na / price_a if price_a > 0 else 0.0
-            shares_b = nb / price_b if price_b > 0 else 0.0
-            shares_a = max(100, int(shares_a / 100) * 100)
-            shares_b = max(100, int(shares_b / 100) * 100)
+            shares_a = max(100, int(na / price_a / 100) * 100)
+            shares_b = max(100, int(nb / price_b / 100) * 100)
             na = shares_a * price_a
             nb = shares_b * price_b
 
             if enter_long:
-                cost_a = _calc_cost(na, "buy", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                cost_b = _calc_cost(nb, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                net_capital_required = na + cost_a + cost_b - nb
-                if net_capital_required > cash:
-                    run_warnings.append(f"{dt.date()}: insufficient capital to open LONG_SPREAD for {label}, skipping.")
+                cost_a   = _calc_cost(na, "buy",  pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cost_b   = _calc_cost(nb, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                required = na + cost_a + cost_b - nb    # short B proceeds partially offset
+                if required > cash:
+                    run_warnings.append(f"{dt.date()}: insufficient capital for LONG_SPREAD {label}, skipping.")
                     continue
-
-                cash -= net_capital_required
-                state["state"] = LONG_SPREAD
-                state["pos_a_shares"] = shares_a
-                state["pos_b_shares"] = shares_b
-                state["pos_a_value"] = na
-                state["pos_b_value"] = nb
-                state["pos_a_side"] = "long"
-                state["pos_b_side"] = "short"
-                state["entry_date"] = dt
-                state["entry_beta"] = beta
-                trade_log.append({
-                    "date": dt,
-                    "pair": label,
-                    "leg": "A",
-                    "ts_code": pair_cfg.ts_code_a,
-                    "action": "BUY",
-                    "shares": shares_a,
-                    "price": price_a,
-                    "notional": na,
-                    "transaction_cost": cost_a,
-                    "note": "",
-                })
-                trade_log.append({
-                    "date": dt,
-                    "pair": label,
-                    "leg": "B",
-                    "ts_code": pair_cfg.ts_code_b,
-                    "action": "SHORT_OPEN",
-                    "shares": shares_b,
-                    "price": price_b,
-                    "notional": nb,
-                    "transaction_cost": cost_b,
-                    "note": "",
-                })
-
-            elif enter_short:
-                cost_a = _calc_cost(na, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                cost_b = _calc_cost(nb, "buy", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
-                net_capital_required = nb + cost_b + cost_a - na
-                if net_capital_required > cash:
-                    run_warnings.append(f"{dt.date()}: insufficient capital to open SHORT_SPREAD for {label}, skipping.")
+                cash    -= required
+                position += na - nb
+                new_state = LONG_SPREAD
+                a_side, b_side = "long", "short"
+                actions = [
+                    ("A", pair_cfg.ts_code_a, "BUY",       shares_a, price_a, na, cost_a),
+                    ("B", pair_cfg.ts_code_b, "SHORT_OPEN", shares_b, price_b, nb, cost_b),
+                ]
+            else:
+                cost_a   = _calc_cost(na, "sell", pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                cost_b   = _calc_cost(nb, "buy",  pair_cfg.commission_rate, pair_cfg.stamp_duty_rate)
+                required = nb + cost_b + cost_a - na
+                if required > cash:
+                    run_warnings.append(f"{dt.date()}: insufficient capital for SHORT_SPREAD {label}, skipping.")
                     continue
+                cash    -= required
+                position += nb - na
+                new_state = SHORT_SPREAD
+                a_side, b_side = "short", "long"
+                actions = [
+                    ("A", pair_cfg.ts_code_a, "SHORT_OPEN", shares_a, price_a, na, cost_a),
+                    ("B", pair_cfg.ts_code_b, "BUY",         shares_b, price_b, nb, cost_b),
+                ]
 
-                cash -= net_capital_required
-                state["state"] = SHORT_SPREAD
-                state["pos_a_shares"] = shares_a
-                state["pos_b_shares"] = shares_b
-                state["pos_a_value"] = na
-                state["pos_b_value"] = nb
-                state["pos_a_side"] = "short"
-                state["pos_b_side"] = "long"
-                state["entry_date"] = dt
-                state["entry_beta"] = beta
+            for leg, ts_code, action, shares, price, notional, cost in actions:
                 trade_log.append({
-                    "date": dt,
-                    "pair": label,
-                    "leg": "A",
-                    "ts_code": pair_cfg.ts_code_a,
-                    "action": "SHORT_OPEN",
-                    "shares": shares_a,
-                    "price": price_a,
-                    "notional": na,
-                    "transaction_cost": cost_a,
-                    "note": "",
+                    "date": dt, "pair": label, "leg": leg, "ts_code": ts_code,
+                    "action": action, "shares": shares, "price": price,
+                    "notional": notional, "transaction_cost": cost, "note": "",
                 })
-                trade_log.append({
-                    "date": dt,
-                    "pair": label,
-                    "leg": "B",
-                    "ts_code": pair_cfg.ts_code_b,
-                    "action": "BUY",
-                    "shares": shares_b,
-                    "price": price_b,
-                    "notional": nb,
-                    "transaction_cost": cost_b,
-                    "note": "",
-                })
+
+            state.update({
+                "state":          new_state,
+                "pos_a_shares":   shares_a,  "pos_b_shares":   shares_b,
+                "pos_a_value":    na,         "pos_b_value":    nb,
+                "pos_a_side":     a_side,     "pos_b_side":     b_side,
+                "entry_date":     dt,         "entry_beta":      beta,
+                "last_price_a":   price_a,    "last_price_b":    price_b,
+                "unrealized_pnl": 0.0,
+            })
 
     equity_df = pd.DataFrame(equity_rows).set_index("date")
-    trade_df = pd.DataFrame(trade_log)
+    trade_df  = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
     return equity_df, trade_df, run_warnings
 
 

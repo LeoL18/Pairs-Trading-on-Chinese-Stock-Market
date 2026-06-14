@@ -140,3 +140,129 @@ def residual_diagnostics(y: pd.Series, x: pd.Series) -> dict | None:
         "last_zscore": z_last,
     }
 
+def rolling_adf_pass_rate(log_price_leg_1, log_price_leg_2, window=252, alpha=0.05):
+
+    pair = pd.concat([log_price_leg_1, log_price_leg_2], axis=1).dropna()
+    pair.columns = ["y", "x"]
+
+    if len(pair) < window:
+        return None
+
+    # estimate hedge ratio once
+    X = sm.add_constant(pair["x"])
+    model = sm.OLS(pair["y"], X).fit()
+    alpha_hat = model.params["const"]
+    beta_hat = model.params["x"]
+    spread = pair["y"] - (alpha_hat + beta_hat * pair["x"])
+    passes = 0
+    total = 0
+
+    for i in range(window, len(spread) + 1):
+        window_spread = spread.iloc[i-window:i]
+        try:
+            stat, pval, *_ = adfuller(window_spread)
+        except:
+            continue
+        total += 1
+        if pval < alpha:
+            passes += 1
+
+    if total == 0:
+        return None
+    return passes / total
+
+# def residual_diagnostics(y: pd.Series, x: pd.Series) -> dict | None:
+#     pair = pd.concat([y, x], axis=1).dropna()
+#     if len(pair) < 500:
+#         return None
+
+#     yv = pair.iloc[:, 0].to_numpy(dtype=float)
+#     xv = pair.iloc[:, 1].to_numpy(dtype=float)
+#     x_design = np.column_stack([np.ones(len(xv)), xv])
+#     alpha, beta = np.linalg.lstsq(x_design, yv, rcond=None)[0]
+#     spread = yv - (alpha + beta * xv)
+#     spread_std = spread.std(ddof=1)
+#     if not np.isfinite(spread_std) or spread_std == 0:
+#         return None
+
+#     spread_lag = spread[:-1]
+#     delta = np.diff(spread)
+#     adf_design = np.column_stack([np.ones(len(spread_lag)), spread_lag])
+#     coef = np.linalg.lstsq(adf_design, delta, rcond=None)[0]
+#     resid = delta - adf_design @ coef
+#     dof = len(delta) - adf_design.shape[1]
+#     if dof <= 0:
+#         return None
+#     sigma2 = (resid @ resid) / dof
+#     xtx_inv = np.linalg.inv(adf_design.T @ adf_design)
+#     se_gamma = math.sqrt(sigma2 * xtx_inv[1, 1])
+#     gamma = coef[1]
+#     adf_t = gamma / se_gamma if se_gamma else np.nan
+
+#     phi = 1 + gamma
+#     half_life = -np.log(2) / np.log(phi) if 0 < phi < 1 else np.nan
+#     z_last = (spread[-1] - spread.mean()) / spread_std
+
+#     return {
+#         "n_obs": len(pair),
+#         "alpha": alpha,
+#         "beta": beta,
+#         "spread_std": spread_std,
+#         "adf_t_approx": adf_t,
+#         "phi": phi,
+#         "half_life_days": half_life,
+#         "last_zscore": z_last,
+#     }
+
+def residual_diagnostics(log_price_leg_1, log_price_leg_2):
+
+    pair = pd.concat([log_price_leg_1, log_price_leg_2], axis=1).dropna()
+    pair.columns = ["y", "x"]
+
+    if len(pair) < 100:
+        return None
+
+    y = pair["y"]
+    x = pair["x"]
+
+    # OLS for hedge ratio
+    X = sm.add_constant(x)
+    model = sm.OLS(y, X).fit()
+
+    alpha = model.params["const"]
+    beta = model.params["x"]
+
+    spread = y - (alpha + beta * x)
+    spread_std = spread.std()
+
+    # AR(1) on spread for mean reversion
+    spread_lag = spread.shift(1).dropna()
+    spread_ret = spread.diff().dropna()
+
+    aligned = pd.concat([spread_ret, spread_lag], axis=1).dropna()
+    aligned.columns = ["dS", "S_lag"]
+
+    ar_model = sm.OLS(aligned["dS"], sm.add_constant(aligned["S_lag"])).fit()
+
+    phi = ar_model.params["S_lag"]
+    adf_t = ar_model.tvalues["S_lag"]
+
+    # half-life
+    if phi < 0:
+        half_life = -np.log(2) / phi
+    else:
+        half_life = np.nan
+
+    # latest z-score
+    z_last = (spread.iloc[-1] - spread.mean()) / spread_std
+
+    return {
+        "n_obs": len(pair),
+        "alpha": alpha,
+        "beta": beta,
+        "spread_std": spread_std,
+        "adf_t_approx": adf_t,
+        "phi": phi,
+        "half_life_days": half_life,
+        "last_zscore": z_last,
+    }

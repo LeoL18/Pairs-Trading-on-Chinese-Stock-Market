@@ -226,38 +226,54 @@ jupyter notebook barra_macro.ipynb
 ## Configuration Example
 
 ```python
-from src.pair_trading_engine import PairTradingConfig, run_backtest
+from src.pair_trading_engine import PairTradingConfig, MultiPairTradingConfig, run_backtest
 
-config = PairTradingConfig(
-    ts_code_a="000001.SZ",  # Ping An Bank
-    ts_code_b="000858.SZ",  # Wuliangye Yiqu
-    
-    # Training window
-    model_start="20220101",
-    model_end="20240101",
-    
-    # Test window
-    test_start="20240101",
-    test_end="20250101",
-    
-    # Entry/exit thresholds
+base_pair_kwargs_pair = dict(
     entry_z=2.0,
     exit_z=0.5,
     stop_loss_z=3.5,
-    
-    # Position sizing
-    sizing="dollar_neutral",
-    capital=1_000_000,
-    
-    # Rolling hedge ratio window
-    ols_window=60,
-    
-    # Macro factor drift detection
-    drift_alert_pct=0.20,
-    drift_alert_days=10,
+    direction="long_short",
+    ols_window=400,
+    rebalance_freq_days=30,
+    sizing="vol_scaled",
+    vol_window=20, 
+    fixed_notional=50_000.0,
+    commission_rate=0.0003,
+    stamp_duty_rate=0.001,
+    cash_buffer_pct=0.80,
 )
 
-result = run_backtest(config)
+start_date = "20160101"
+end_date = "20240101"
+
+pair_cfgs = [
+    PairTradingConfig(
+        ts_code_a="000729.SZ",
+        ts_code_b="601099.SH",
+        pair_name="pair_1",
+        start_date=start_date,
+        end_date=end_date,
+        **base_pair_kwargs,
+    ),
+    PairTradingConfig(
+        ts_code_a="000776.SZ",
+        ts_code_b="601877.SH",
+        pair_name="pair_2",
+        start_date=start_date,
+        end_date=end_date,
+        **base_pair_kwargs,
+    ),
+]
+
+multi_pair_cfg = MultiPairTradingConfig(
+    pairs=pair_cfgs,
+    start_date=start_date,
+        end_date=end_date,
+    capital=1_000_000.0,
+    db_path=Path("data/prices.sqlite"),
+)
+
+result = run_backtest(multi_pair_cfg)
 print(f"Sharpe Ratio: {result.stats['sharpe_ratio']:.2f}")
 print(f"Max Drawdown: {result.stats['max_drawdown']:.2%}")
 ```
@@ -271,18 +287,26 @@ print(f"Max Drawdown: {result.stats['max_drawdown']:.2%}")
 ✅ **Comprehensive diagnostics**: Drift alerts, residual checks, correlation tracking  
 ✅ **Transaction costs**: Commission + stamp duty applied realistically  
 
-## Backtesting Results & Diagrams
+## Final Strategy Backtesting Results & Diagrams
 
-**Placeholder Section for Backtesting Diagram**
+## Backtest Summary
 
-*To be populated with:*
-- Equity curve overlay
-- Entry/exit signal timing on Z-score chart
-- Position composition (notional long vs. short)
-- Drawdown analysis
-- Win/loss rate histogram
+| Metric | Value |
+|---|---|
+| Round-Trip Trades | 44 |
+| Win Rate | 72.73% |
+| Avg Round-Trip PnL | ¥82,649.73 |
+| Total Transaction Costs | ¥91,121.62 |
+| Starting Portfolio Value | ¥1,000,000.00 |
+| Ending Portfolio Value | ¥5,002,378.23 |
+| Rebalance Frequency | 30 days |
+| Traded Pairs | pair_1, pair_2, pair_3, pair_4, pair_5 |
 
----
+### Portfolio Value
+
+![Portfolio Value](figures/PortfolioValue.png)
+
+
 
 ## References & Further Reading
 
